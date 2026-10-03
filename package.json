@@ -6,6 +6,8 @@
   "scripts": {
     "clean:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/clean-local.ps1 -Force",
     "dev": "wrangler dev",
+    "build:frontend": "npm --prefix frontend run build:selfhost",
+    "build": "npm run build:frontend",
     "deploy": "wrangler deploy",
     "build:node": "esbuild server/index.ts --bundle --platform=node --target=node22 --format=esm --external:cloudflare:sockets --outfile=dist-node/server.mjs",
     "start:node": "node dist-node/server.mjs",

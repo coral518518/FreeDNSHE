@@ -14,3 +14,5 @@ data/
 # 本地专用：前端设计规范与配套静态校验脚本（仅本机使用，不随仓库发布）
 docs/前端设计规范.md
 check-controls-static.mjs
+
+wrangler.toml
