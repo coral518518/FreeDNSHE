@@ -45,9 +45,37 @@ CREATE TABLE IF NOT EXISTS cache (
     expires_at INTEGER NOT NULL           -- 绝对过期时间 (epoch 秒)
 );
 
+-- 5. 系统设置与会话凭据表
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. DNSHE API 密钥登记表（Secret 本地加密存储）
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL,
+    key_id INTEGER,
+    key_name TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    api_secret_enc TEXT,
+    status TEXT,
+    request_count INTEGER,
+    last_used_at TEXT,
+    remote_created_at TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
 -- 创建索引以加速跨账号域名搜索和定时扫描
 CREATE INDEX IF NOT EXISTS idx_domains_account ON domains_cache(account_id);
 CREATE INDEX IF NOT EXISTS idx_domains_expires ON domains_cache(expires_at);
 CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
 -- 加速查重池的过期过滤与每日过期行清理
 CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at);
+-- 加速 API 密钥查询
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_account_keyid ON api_keys(account_id, key_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_account_apikey ON api_keys(account_id, api_key);
+

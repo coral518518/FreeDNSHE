@@ -369,6 +369,9 @@ export class DatabaseManager {
         `),
         this.db.prepare(
           "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_account_keyid ON api_keys(account_id, key_id)"
+        ),
+        this.db.prepare(
+          "CREATE INDEX IF NOT EXISTS idx_api_keys_account_apikey ON api_keys(account_id, api_key)"
         )
       ]);
 
@@ -1479,7 +1482,11 @@ export class DatabaseManager {
     }
 
     if (statements.length > 0) {
-      await this.db.batch(statements);
+      // 避免超过 Cloudflare D1 batch 单次 100 条语句上限，按 50 条分批执行
+      const BATCH_SIZE = 50;
+      for (let i = 0; i < statements.length; i += BATCH_SIZE) {
+        await this.db.batch(statements.slice(i, i + BATCH_SIZE));
+      }
     }
   }
 

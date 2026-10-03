@@ -54,51 +54,23 @@ async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number
   return zones.length;
 }
 
-// NOTE: 深度同步单个 DNSHE 账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
-// 与 cron.ts 中 "同步所有域名" 的逻辑保持一致，供绑定/批量/修改换 Key 后调用
-async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
-  const subdomains = await fetchAllSubdomainsFromClient(client);
-
-  // 并发拉取每个子域名的 DNS 记录，自动计算真实状态
-  const enriched = await Promise.all(
-    subdomains.map(async (sub) => {
-      try {
-        const recordsRes = await client.listDnsRecords(sub.id);
-        const records = recordsRes.records || [];
-
-        // 深度同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
-        await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
-
-        return { ...sub, ...computeDnsState(records) };
-      } catch (e: unknown) {
-        console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
-        // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
-        return { ...sub };
-      }
-    })
-  );
-
-  if (enriched.length > 0) {
-    await dbManager.syncAccountDomains(accountId, enriched);
-  }
-  return subdomains.length;
+// NOTE: 同步单个 DNSHE 账号的域名缓存（增量复核 + 预算控制，防撞 50 子请求上限与限流）
+async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, _client?: DNSHEClient): Promise<number> {
+  const result = await syncOneAccountDomains(dbManager, accountId, { budget: SYNC_SUBREQUEST_BUDGET });
+  return result.count;
 }
 
-// NOTE: 账号绑定/换 Key 后逐个账号深度同步域名，并刷新该账号的配额缓存
+// NOTE: 账号绑定/换 Key 后逐个账号同步域名，并刷新该账号的配额缓存
 //       （间隔 1.2s 规避 DNSHE 速率限制）
 async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds: number[]) {
   for (const id of accountIds) {
     try {
-      const { client, alias, provider } = await dbManager.getClientForAccount(id);
+      const { alias, provider } = await dbManager.getClientForAccount(id);
       // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
       // 放在后面做会让配额缓存慢于这个信号，用户切到配额页仍是旧数据
       await dbManager.refreshAccountQuotaCache(id, alias, provider);
-      const synced = client instanceof CloudflareClient
-        ? await syncCloudflareZones(dbManager, id, client)
-        : client instanceof DNSHEClient
-          ? await deepSyncAccountDomains(dbManager, id, client)
-          : 0;
-      console.log(`Deep sync finished for account ${id}: ${synced} domains`);
+      const res = await syncOneAccountDomains(dbManager, id, { budget: SYNC_SUBREQUEST_BUDGET });
+      console.log(`Sync finished for account ${id} (${res.alias || alias}): ${res.count} domains, checked ${res.checked}`);
     } catch (e: unknown) {
       console.error(`Background account resync failed for account ${id}:`, e);
     }
@@ -166,12 +138,9 @@ async function ensureDefaultAccount(c: any, dbManager: DatabaseManager) {
       const exists = existingAccounts.some(acc => acc.api_key === apiKey);
       if (!exists) {
         const newAcc = await dbManager.addAccount(alias, apiKey, apiSecret);
-        // 深度同步一次域名，保证自动分类（已委派/已解析/未解析）
+        // 同步一次域名，保证自动分类（已委派/已解析/未解析）
         try {
-          const { client } = await dbManager.getClientForAccount(newAcc.id);
-          if (client instanceof DNSHEClient) {
-            await deepSyncAccountDomains(dbManager, newAcc.id, client);
-          }
+          await syncOneAccountDomains(dbManager, newAcc.id, { budget: SYNC_SUBREQUEST_BUDGET });
         } catch (syncErr) {
           console.error("Default account auto-sync failed:", syncErr);
         }
@@ -196,6 +165,13 @@ const LOGIN_MAX_FAILURES = 5;
 const LOGIN_LOCK_WINDOW_SECONDS = 15 * 60;
 
 const LOGIN_LOCKED_MESSAGE = "登录失败次数过多，账号已临时锁定，请 15 分钟后再试";
+
+// ===== DNS 批量与写操作常量 =====
+/** 批量写入 DNS 记录的单次上限（与上游 30-60 请求/分钟的限频折中） */
+const DNS_BATCH_LIMIT = 50;
+
+/** 批量写操作与委派写入之间的间隔（毫秒），规避 DNSHE 上游限频 */
+const DNS_BATCH_INTERVAL = 300;
 
 // ===== 安全响应头 =====
 
@@ -1807,12 +1783,6 @@ app.post("/api/domains/:id/dns", async (c) => {
   }
 });
 
-/** 批量写入 DNS 记录的单次上限（与上游 30-60 请求/分钟的限频折中） */
-const DNS_BATCH_LIMIT = 50;
-
-/** 批量写操作之间的间隔（毫秒），规避 DNSHE 上游限频 */
-const DNS_BATCH_INTERVAL = 300;
-
 /** 批量操作的单条结果 */
 interface DnsBatchItemResult {
   label: string;
@@ -2893,9 +2863,12 @@ app.get("/api/expiry", async (c) => {
   }
 
   // 2. 未命中的并发回源（不同 TLD 落在不同注册局的 RDAP 服务，压力天然分散）。
+  //    因 rdap.org 存在 HTTP 重定向（每个域名消耗 2 次网络子请求），
+  //    单次调用最多回源 20 个新域名，防止超过 Workers 免费版 50 子请求上限。
   //    错误在任务内部就地捕获：查询失败不落缓存（下次请求重试），其余结果（含 404）落 7 天缓存。
+  const queryBatch = toQuery.slice(0, 20);
   const settled = await Promise.allSettled(
-    toQuery.map((d) =>
+    queryBatch.map((d) =>
       fetchExpiryViaRdap(d)
         .then(async (result) => {
           await dbManager.setCache(`rdap:${d}`, JSON.stringify(result), RDAP_CACHE_TTL);

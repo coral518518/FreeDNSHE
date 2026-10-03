@@ -233,6 +233,12 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
   if (!cleanHost || !cleanPort || !cleanUser || !cleanPass || !to) {
     return { ok: false, detail: "SMTP 配置不完整：需要服务器、端口、账号、授权码、收件人" };
   }
+  if (cleanPort !== 465) {
+    return {
+      ok: false,
+      detail: `SMTP 当前仅支持 465 端口（SSL/TLS 隐式加密）。端口 ${cleanPort}（如 587/25 需 STARTTLS 协议升级）暂不支持，请将端口配置为 465。`,
+    };
+  }
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const b64 = (s: string) => btoa(unescape(encodeURIComponent(s)));
@@ -288,7 +294,8 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
     const greet = await readResponse();
     if (!greet.startsWith("220")) throw new Error(`服务端问候异常：${greet}`);
 
-    await cmd("EHLO shydns.cc.cd");
+    const senderDomain = from.includes("@") ? from.split("@")[1].trim() : "";
+    await cmd(`EHLO ${senderDomain || "localhost"}`);
 
     const authStart = await cmd("AUTH LOGIN");
     if (!authStart.startsWith("334")) throw new Error(`服务端不支持 AUTH LOGIN：${authStart}`);
@@ -525,9 +532,12 @@ export async function syncOneAccountDomains(
       const sub = byId.get(id);
       try {
         const recordsRes = await client.listDnsRecords(id);
+        const records = recordsRes.records || [];
+        // 同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
+        await dbManager.setCache(`api_cache:dns:${id}`, JSON.stringify(records));
         checkedById.set(id, {
           id,
-          ...computeDnsState(recordsRes.records || []),
+          ...computeDnsState(records),
           // 记下本次复核时的上游时间戳；下次它没变就直接跳过
           remote_updated_at: sub?.updated_at ? String(sub.updated_at) : undefined,
         });
