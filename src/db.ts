@@ -55,7 +55,9 @@ async function getCryptoKey(aesKeyStr: string): Promise<CryptoKey> {
  */
 export async function encryptText(text: string, aesKeyStr?: string): Promise<string> {
   if (!aesKeyStr) {
-    return "plain:" + btoa(text);
+    console.warn("⚠️ [Security Warning] AES_KEY 未配置，敏感数据将使用 Base64 编码形式存储。建议在环境变量或 wrangler secret 中注入 AES_KEY！");
+    const b64 = btoa(unescape(encodeURIComponent(text)));
+    return "plain:" + b64;
   }
 
   const encoder = new TextEncoder();
@@ -78,7 +80,12 @@ export async function encryptText(text: string, aesKeyStr?: string): Promise<str
  */
 export async function decryptText(encryptedText: string, aesKeyStr?: string): Promise<string> {
   if (encryptedText.startsWith("plain:")) {
-    return atob(encryptedText.substring(6));
+    const rawB64 = encryptedText.substring(6);
+    try {
+      return decodeURIComponent(escape(atob(rawB64)));
+    } catch {
+      return atob(rawB64);
+    }
   }
   if (!aesKeyStr) {
     throw new Error("Encrypted secret requires AES_KEY to decrypt");
@@ -721,6 +728,19 @@ export class DatabaseManager {
   }
 
   /**
+   * 注销全部会话（管理员修改密码或进行全局安全重置时调用，强制所有设备重新登录）
+   */
+  async revokeAllSessions(): Promise<number> {
+    try {
+      const res = await this.db.prepare("DELETE FROM settings WHERE key LIKE 'sess_%'").run();
+      return res.meta?.changes || 0;
+    } catch (e) {
+      console.error("revokeAllSessions error:", e);
+      return 0;
+    }
+  }
+
+  /**
    * 清理已过期会话 — 供每日 cron 调用，返回清理条数
    */
   async purgeExpiredSessions(ttlSeconds = DatabaseManager.SESSION_TTL_SECONDS): Promise<number> {
@@ -867,12 +887,14 @@ export class DatabaseManager {
 
   /**
    * 校验管理员密码
+   * 可选传入已读取的 passSalt 与 passHash，避免登录流程中产生重复的 D1 往返查询
    */
-  async verifyPassword(password: string): Promise<boolean> {
-    const cfg = await this.getAuthConfig();
-    if (!cfg.passHash || !cfg.passSalt) return false;
-    const hash = await hashPassword(password, cfg.passSalt);
-    return timingSafeEqual(hash, cfg.passHash);
+  async verifyPassword(password: string, passSalt?: string, passHash?: string): Promise<boolean> {
+    const salt = passSalt !== undefined ? passSalt : (await this.getAuthConfig()).passSalt;
+    const expectedHash = passHash !== undefined ? passHash : (await this.getAuthConfig()).passHash;
+    if (!expectedHash || !salt) return false;
+    const hash = await hashPassword(password, salt);
+    return timingSafeEqual(hash, expectedHash);
   }
 
   /**

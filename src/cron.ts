@@ -221,10 +221,18 @@ export interface SmtpConfig {
  *   连接超时       → 端口填错（465 才是隐式 TLS），或该 SMTP 服务商封了 Cloudflare 出口 IP
  */
 export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: string): Promise<WebhookSendResult> {
-  if (!cfg.host || !cfg.port || !cfg.user || !cfg.pass || !cfg.to) {
+  const sanitize = (v: string) => String(v || "").replace(/[\r\n<>]/g, "").trim();
+  const cleanHost = String(cfg.host || "").replace(/[\r\n]/g, "").trim();
+  const cleanPort = Number(cfg.port) || 465;
+  const cleanUser = String(cfg.user || "").replace(/[\r\n]/g, "").trim();
+  const cleanPass = String(cfg.pass || "").replace(/[\r\n]/g, "").trim();
+  const from = sanitize(cfg.from || cfg.user);
+  const to = sanitize(cfg.to);
+  const cleanSubject = String(subject || "").replace(/[\r\n]/g, " ").trim();
+
+  if (!cleanHost || !cleanPort || !cleanUser || !cleanPass || !to) {
     return { ok: false, detail: "SMTP 配置不完整：需要服务器、端口、账号、授权码、收件人" };
   }
-  const from = cfg.from || cfg.user;
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const b64 = (s: string) => btoa(unescape(encodeURIComponent(s)));
@@ -243,7 +251,7 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
   let socket: WorkerTlsSocket;
   try {
     socket = connect(
-      { hostname: cfg.host, port: cfg.port },
+      { hostname: cleanHost, port: cleanPort },
       { secureTransport: "on", allowHalfOpen: false }
     );
   } catch (e) {
@@ -284,16 +292,16 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
 
     const authStart = await cmd("AUTH LOGIN");
     if (!authStart.startsWith("334")) throw new Error(`服务端不支持 AUTH LOGIN：${authStart}`);
-    const userResp = await cmd(b64(cfg.user));
+    const userResp = await cmd(b64(cleanUser));
     if (!userResp.startsWith("334")) throw new Error(`用户名被拒绝：${userResp}`);
-    const passResp = await cmd(b64(cfg.pass));
+    const passResp = await cmd(b64(cleanPass));
     if (!passResp.startsWith("235")) {
       throw new Error(`登录失败：${passResp}（QQ 邮箱请填「授权码」而非登录密码）`);
     }
 
     const mailFrom = await cmd(`MAIL FROM:<${from}>`);
     if (!mailFrom.startsWith("250")) throw new Error(`发件人被拒绝：${mailFrom}`);
-    const rcptTo = await cmd(`RCPT TO:<${cfg.to}>`);
+    const rcptTo = await cmd(`RCPT TO:<${to}>`);
     if (!rcptTo.startsWith("250")) throw new Error(`收件人被拒绝：${rcptTo}`);
 
     const dataStart = await cmd("DATA");
@@ -301,8 +309,8 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
 
     const headers = [
       `From: =?UTF-8?B?${b64("DNSHE 集控台")}?= <${from}>`,
-      `To: <${cfg.to}>`,
-      `Subject: =?UTF-8?B?${b64(subject)}?=`,
+      `To: <${to}>`,
+      `Subject: =?UTF-8?B?${b64(cleanSubject)}?=`,
       "MIME-Version: 1.0",
       'Content-Type: text/plain; charset="UTF-8"',
       "Content-Transfer-Encoding: base64",
@@ -337,23 +345,41 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
   }
 }
 
-export async function sendTelegramNotification(botToken: string, chatId: string, message: string) {  if (!botToken || !chatId) return;
+export async function sendTelegramNotification(
+  botToken: string,
+  chatId: string,
+  message: string
+): Promise<WebhookSendResult> {
+  const cleanToken = String(botToken || "").trim();
+  const cleanChatId = String(chatId || "").trim();
+  if (!cleanToken || !cleanChatId) {
+    return { ok: false, detail: "未配置 Telegram Bot Token 或 Chat ID" };
+  }
   try {
-    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const url = `https://api.telegram.org/bot${encodeURIComponent(cleanToken)}/sendMessage`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        chat_id: chatId,
+        chat_id: cleanChatId,
         text: message,
         disable_web_page_preview: true,
       }),
     });
+    const bodyText = (await res.text().catch(() => "")).slice(0, 500);
     if (!res.ok) {
       console.error(`Telegram push failed with status: ${res.status}`);
+      let detail = `HTTP ${res.status}`;
+      try {
+        const parsed = JSON.parse(bodyText) as { description?: string };
+        if (parsed.description) detail = parsed.description;
+      } catch {}
+      return { ok: false, status: res.status, detail: `Telegram 平台返回错误：${detail}` };
     }
+    return { ok: true, status: res.status, detail: bodyText };
   } catch (e) {
     console.error("Failed to send Telegram notification:", e);
+    return { ok: false, detail: e instanceof Error ? e.message : "请求异常" };
   }
 }
 
@@ -536,16 +562,39 @@ export async function syncOneAccountDomains(
 }
 
 
+export interface DefaultAccountConfig {
+  apiKey?: string;
+  apiSecret?: string;
+  alias?: string;
+}
+
 /**
  * 核心定时任务：全量同步所有账号的域名并自动续期即将到期的域名
  */
 export async function runDailySyncAndRenewal(
   dbManager: DatabaseManager,
   webhookUrl?: string,
-  webhookType: WebhookType = "custom"
+  webhookType: WebhookType = "custom",
+  defaultAccount?: DefaultAccountConfig
 ) {
   await dbManager.ensureTables();
   await dbManager.writeLog("info", "system", "自动定时任务启动：开始执行域名同步与到期检测续期任务");
+
+  // 如果配置了环境变量默认账号，定时任务启动时自举，避免从未打开前端导致账号未录入
+  if (defaultAccount?.apiKey && defaultAccount?.apiSecret) {
+    try {
+      const existingAccounts = await dbManager.getAccounts();
+      if (!existingAccounts.some((acc) => acc.api_key === defaultAccount.apiKey)) {
+        await dbManager.addAccount(
+          defaultAccount.alias || "默认账号 (环境变量)",
+          defaultAccount.apiKey,
+          defaultAccount.apiSecret
+        );
+      }
+    } catch (e) {
+      console.error("Cron auto registration of default account failed:", e);
+    }
+  }
 
   // 读取数据库应用配置（优先级高于环境变量）
   const appCfg = await dbManager.getAllAppSettings();
@@ -766,7 +815,15 @@ export async function runDailySyncAndRenewal(
       //    「渠道选择里被选中的那一个」。设置页已把 Telegram 并进统一的渠道下拉，
       //    若仍保持无条件补发，用户选了「邮箱」也会收到 TG 消息，与界面表达不符。
       if (tgToken && tgChatId) {
-        await sendTelegramNotification(tgToken, tgChatId, notifyBody);
+        const tgRes = await sendTelegramNotification(tgToken, tgChatId, notifyBody);
+        if (!tgRes.ok) {
+          await dbManager.writeLog(
+            "warning",
+            "system",
+            "续期报告 Telegram 推送失败",
+            tgRes.detail || ""
+          );
+        }
       } else {
         await dbManager.writeLog(
           "warning",

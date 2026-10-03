@@ -417,8 +417,8 @@ async function verifyTOTP(token?: string, secretStr?: string): Promise<boolean> 
         ["sign"]
       );
 
-      // 容忍 ±1 窗口 (±30秒)，精准标准时间步容差
-      for (let i = -1; i <= 1; i++) {
+      // 容忍 ±2 窗口 (±60秒)，精准标准时间步容差
+      for (let i = -2; i <= 2; i++) {
         const t = currentT + i;
         const buffer = new ArrayBuffer(8);
         const view = new DataView(buffer);
@@ -517,6 +517,18 @@ app.post("/api/auth/setup", async (c) => {
     const username = String(body.username || "").trim();
     const password = String(body.password || "");
 
+    // 若环境变量中配置了 ADMIN_TOKEN，首次设置时必须通过此令牌验证，防止被公网扫描器抢注接管
+    const emergencyToken = c.env.ADMIN_TOKEN || "";
+    if (emergencyToken) {
+      const authHeader = c.req.header("Authorization") || "";
+      const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : "";
+      const candidate = String(body.admin_token || body.token || bearerToken).trim();
+      const emgTotpValid = await verifyTOTP(candidate, emergencyToken);
+      if (!timingSafeEqual(candidate, emergencyToken) && !emgTotpValid) {
+        return c.json(errorRes("系统配置了 ADMIN_TOKEN 环境变量，首次初始化必须提供有效的管理员令牌以防未授权接管", "forbidden"), 403);
+      }
+    }
+
     if (!username || username.length < 3) {
       return c.json(errorRes("用户名至少需要 3 个字符", "bad_request"), 400);
     }
@@ -600,9 +612,9 @@ app.post("/api/auth/login", async (c) => {
       return c.json(errorRes("请输入用户名与密码", "bad_request"), 400);
     }
 
-    // 1. 校验用户名 + 密码
+    // 1. 校验用户名 + 密码（传入已读取的 salt/hash，避免多产生一次 D1 往返）
     const userMatch = timingSafeEqual(username, cfg.username);
-    const passMatch = await dbManager.verifyPassword(password);
+    const passMatch = await dbManager.verifyPassword(password, cfg.passSalt, cfg.passHash);
     if (!userMatch || !passMatch) {
       await dbManager.writeLog("warning", "auth", `管理员登录失败：用户名或密码错误 (输入用户名: ${capText(username)})`);
       await noteFailure();
@@ -751,7 +763,9 @@ app.post("/api/auth/change-password", async (c) => {
 
     const finalUsername = (newUsername && newUsername.length >= 3) ? newUsername : cfg.username;
     await dbManager.setPassword(finalUsername, newPassword);
-    await dbManager.writeLog("success", "auth", `管理员 [${finalUsername}] 修改了登录密码`);
+    // 密码已变更，强制注销所有历史 Session，防止已被劫持的会话残留
+    await dbManager.revokeAllSessions();
+    await dbManager.writeLog("success", "auth", `管理员 [${finalUsername}] 修改了登录密码，已重置所有活动会话`);
 
     return c.json(successRes({ message: "密码修改成功，请使用新密码重新登录" }));
   } catch (e: any) {
@@ -1494,7 +1508,12 @@ app.post("/api/domains/:id/delegate-cloudflare", async (c) => {
   let zone: { id: string; name: string; status: string; name_servers: string[] };
   let zoneReused = false;
   try {
-    zone = await cfClient.createZone(domainInfo.full_domain, cfAccount.id);
+    // 优先提取保存在 accounts.api_key 中的真实 Cloudflare 账号 32 位 Hex ID
+    let realCfAccountId: string | number = cfAccount.id;
+    if (cfAccount.api_key.startsWith("cf:") && !cfAccount.api_key.startsWith("cf:token:")) {
+      realCfAccountId = cfAccount.api_key.slice(3);
+    }
+    zone = await cfClient.createZone(domainInfo.full_domain, realCfAccountId);
   } catch (e) {
     const msg = e instanceof Error ? e.message : "创建 zone 失败";
     const existing = /already exists|1061/i.test(msg)
@@ -2428,7 +2447,10 @@ app.post("/api/settings/test-telegram", async (c) => {
       return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
     }
 
-    await sendTelegramNotification(token, chatId, "🎉 DNSHE Manager 测试推送：Telegram 通知配置成功！");
+    const tgRes = await sendTelegramNotification(token, chatId, "🎉 DNSHE Manager 测试推送：Telegram 通知配置成功！");
+    if (!tgRes.ok) {
+      return c.json(errorRes(tgRes.detail || "Telegram 消息发送失败"), 400);
+    }
     return c.json(successRes({ message: "测试消息已发送，请检查 Telegram" }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
@@ -2484,7 +2506,10 @@ app.post("/api/settings/test-webhook", async (c) => {
       if (!token || !chatId) {
         return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
       }
-      await sendTelegramNotification(token, chatId, "🎉 DNSHE 集控台 测试推送：Telegram 通知渠道配置成功！");
+      const tgRes = await sendTelegramNotification(token, chatId, "🎉 DNSHE 集控台 测试推送：Telegram 通知渠道配置成功！");
+      if (!tgRes.ok) {
+        return c.json(errorRes(tgRes.detail || "Telegram 推送失败"), 400);
+      }
       return c.json(successRes({ message: "测试消息已发送，请检查 Telegram" }));
     }
 
@@ -3810,6 +3835,10 @@ export default {
     const dbManager = new DatabaseManager(env.DB, env.AES_KEY);
     const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
     // 使用 ctx.waitUntil 保证 Worker 不会在异步任务未结束时被回收
-    ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType));
+    ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType, {
+      apiKey: env.DEFAULT_API_KEY,
+      apiSecret: env.DEFAULT_API_SECRET,
+      alias: env.DEFAULT_API_ALIAS,
+    }));
   }
 };

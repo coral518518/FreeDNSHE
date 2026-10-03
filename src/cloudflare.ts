@@ -286,11 +286,49 @@ export class CloudflareClient {
    *   · 不传 `jump_start` —— 那会让 CF 自己去扫旧解析并预填记录，结果不可预期；
    *     记录迁移必须走「用户确认后显式写入」，见 /api/domains/:id/delegate-cloudflare。
    *   · 不读 `vanity_name_servers` —— 自定义 NS 是 Business+ 专属，本项目不涉及。
+  /**
+   * 确保获得有效的 Cloudflare 32 位 Hex 账号 ID
+   *
+   * NOTE: 若调用方误传了本地数据库数值主键（如 1、2），或未传账号 ID，
+   * 自动通过 /accounts 或 /zones 回退解析，避免直接向 Cloudflare 抛出 HTTP 400 Invalid account identifier。
+   */
+  async resolveAccountId(candidateId?: string | number): Promise<string> {
+    const raw = String(candidateId ?? "").trim();
+    if (/^[0-9a-f]{32}$/i.test(raw)) {
+      return raw;
+    }
+    try {
+      const accounts = await this.listAccounts();
+      if (accounts[0]?.id) return accounts[0].id;
+    } catch {}
+    try {
+      const zones = await this.listZones();
+      const zoneAcc = zones.find((z) => z.account?.id)?.account?.id;
+      if (zoneAcc) return zoneAcc;
+    } catch {}
+    return raw;
+  }
+
+  /**
+   * 在指定账号下创建一个 full setup zone（「域名委派到 Cloudflare」第一步）
+   *
+   * 🔴 前置条件由调用方保证：只有「可注册根域名」才建得成。Cloudflare 用 Public
+   *    Suffix List 判根域/子域 —— x.<root> 只有在 <root> 本身是 public suffix 时
+   *    才算根域（免费版可建 full zone + 委派 NS）；否则 CF 视为子域，Free/Pro 直接
+   *    拒绝，真委派要 Enterprise。DNSHE 的 9 个根里只有 4 个在 PSL 里。
+   *
+   * NOTE: 三个刻意的取舍
+   *   · `type: "full"` —— 本 zone 的权威解析交给 Cloudflare，这正是「委派」的含义；
+   *     partial（CNAME 接入）会保留原权威 DNS，与委派语义不符。
+   *   · 不传 `jump_start` —— 那会让 CF 自己去扫旧解析并预填记录，结果不可预期；
+   *     记录迁移必须走「用户确认后显式写入」，见 /api/domains/:id/delegate-cloudflare。
+   *   · 不读 `vanity_name_servers` —— 自定义 NS 是 Business+ 专属，本项目不涉及。
    */
   async createZone(name: string, accountId: string | number): Promise<CfZoneCreateResult> {
+    const resolvedAccountId = await this.resolveAccountId(accountId);
     const result = await this.request<CfZoneInfo>("POST", "/zones", undefined, {
       name: String(name || "").trim().toLowerCase(),
-      account: { id: String(accountId ?? "").trim() },
+      account: { id: resolvedAccountId },
       type: "full",
     });
     return {

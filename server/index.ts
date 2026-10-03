@@ -6,7 +6,7 @@
  *   1. env 绑定  —— 用 process.env + 本地 SQLite 组装出与 wrangler.toml 等价的 env，
  *                   通过 app.fetch(request, env, ctx) 注入，因此 src/ 一行都不用改
  *   2. executionCtx.waitUntil —— Node 进程不会被回收，退化成「记录异常的即发即忘」
- *   3. Cron Trigger —— 用定时器在每天 UTC 02:00 调用同一个 runDailySyncAndRenewal
+ *   3. Cron Trigger —— 用定时器在每天 UTC 02:58 调用同一个 runDailySyncAndRenewal
  *
  * 前端由同一个端口以静态文件形式发出（同源），因此不需要配置 CORS。
  */
@@ -206,7 +206,11 @@ function scheduleCron(): void {
     void (async () => {
       try {
         const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
-        await runDailySyncAndRenewal(new DatabaseManager(db, aesKey), env.WEBHOOK_URL, webhookType);
+        await runDailySyncAndRenewal(new DatabaseManager(db, aesKey), env.WEBHOOK_URL, webhookType, {
+          apiKey: env.DEFAULT_API_KEY,
+          apiSecret: env.DEFAULT_API_SECRET,
+          alias: env.DEFAULT_API_ALIAS,
+        });
       } catch (e) {
         console.error("[cron] 定时任务执行失败：", e);
       } finally {
@@ -224,10 +228,9 @@ const server = serve({ fetch: fetchHandler, hostname: HOST, port: PORT }, (info)
   console.log(`  数据库    ${DB_PATH}`);
   console.log(`  前端产物  ${STATIC_DIR}`);
   console.log(
-    `  加密密钥  ${
-      aesKeySource === "env"
-        ? "来自环境变量 AES_KEY"
-        : aesKeySource === "file"
+    `  加密密钥  ${aesKeySource === "env"
+      ? "来自环境变量 AES_KEY"
+      : aesKeySource === "file"
         ? `来自 ${path.join(DATA_DIR, "aes.key")}`
         : `已自动生成并写入 ${path.join(DATA_DIR, "aes.key")}`
     }`
