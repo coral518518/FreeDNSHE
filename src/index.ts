@@ -11,6 +11,7 @@ import type { WebhookType } from "./cron";
 import { computeDnsState } from "./dns-provider";
 import type { DnsState } from "./dns-provider";
 import { toASCII } from "./punycode";
+import { withPrismAuth } from "../prism-auth.js";
 
 /**
  * 统一成功响应封装 — 将 payload 扁平化后附加 success: true，
@@ -43,6 +44,14 @@ type Bindings = {
   DEFAULT_API_ALIAS?: string;
   /** 域名助力快照缓存（并入自 dnshe-assist） */
   ASSIST_KV?: KVNamespace;
+  /** Cloudflare Workers Assets 静态资源绑定（run_worker_first = ["/*"] 时可用） */
+  ASSETS?: Fetcher;
+  /** Prism 鉴权中心配置 */
+  PRISM_URL?: string;
+  PRISM_CLIENT_ID?: string;
+  PRISM_CLIENT_SECRET?: string;
+  COOKIE_DOMAIN?: string;
+  PRISM_SCOPE?: string;
 };
 
 // NOTE: 深度同步 Cloudflare 账号的 zone 列表。zones 拉取成功即视为权威结论——
@@ -3791,6 +3800,51 @@ app.get("/api/overview", async (c) => {
 });
 
 /**
+ * 包装 Prism 鉴权的业务请求处理器
+ *
+ * NOTE:
+ * 1. 静态资源（/assets/*、/favicon.ico、/theme-init.js）在 isPublic 白名单放行；
+ * 2. 页面访问（/、SPA 路由）及 API 请求（/api/*）需通过 Prism 鉴权；
+ * 3. 鉴权通过后：/api/* 交由 Hono 处理；静态前端页面交由 env.ASSETS 处理。
+ */
+const handleWithPrism = withPrismAuth(
+  async (request: Request, env: Bindings, ctx: ExecutionContext, _user: unknown) => {
+    const url = new URL(request.url);
+
+    // 1. API 接口：交给 Hono 业务路由处理
+    if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
+      const res = await app.fetch(request, env, ctx);
+      return withSecurityHeaders(res);
+    }
+
+    // 2. 前端静态页面与资源（Cloudflare Assets / 自建版静态委托）
+    if (env.ASSETS) {
+      const assetRes = await env.ASSETS.fetch(request);
+      if (assetRes.status === 404) {
+        // SPA 页面路由回退到 index.html
+        return await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), request));
+      }
+      return assetRes;
+    }
+
+    return new Response(
+      "Worker 配置错误：未找到 env.ASSETS 静态资源绑定。请确保 wrangler.toml 的 [assets] 下配置了 binding = \"ASSETS\" 并重新部署。",
+      { status: 500, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+    );
+  },
+  {
+    isPublic(url: URL, req: Request) {
+      return (
+        req.method === "OPTIONS" ||
+        url.pathname === "/favicon.ico" ||
+        url.pathname.startsWith("/assets/") ||
+        url.pathname === "/theme-init.js"
+      );
+    },
+  }
+);
+
+/**
  * 导出 Worker 入口
  *
  * NOTE: fetch 出口统一包一层 withSecurityHeaders —— API 响应由这里补安全头；
@@ -3799,8 +3853,23 @@ app.get("/api/overview", async (c) => {
  */
 export default {
   async fetch(request: Request, env: Bindings, ctx: ExecutionContext): Promise<Response> {
-    const res = await app.fetch(request, env, ctx);
-    return withSecurityHeaders(res);
+    const url = new URL(request.url);
+
+    // 平滑降级：若未配置 Prism 核心环境变量，直接按原系统流程处理（方便开发与自建版未开启 Prism 时的兼容）
+    if (!env.PRISM_URL || !env.PRISM_CLIENT_ID || !env.PRISM_CLIENT_SECRET) {
+      if (env.ASSETS && !url.pathname.startsWith("/api/")) {
+        const assetRes = await env.ASSETS.fetch(request);
+        if (assetRes.status === 404) {
+          return await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), request));
+        }
+        return assetRes;
+      }
+      const res = await app.fetch(request, env, ctx);
+      return withSecurityHeaders(res);
+    }
+
+    // 启用 Prism 统一鉴权
+    return handleWithPrism(request, env, ctx);
   },
 
   // 处理 scheduled 定时任务 (Cron Trigger)

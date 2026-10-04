@@ -116,6 +116,8 @@ if (existsSync(SCHEMA_FILE)) {
   console.warn(`[warn] 未找到 schema.sql（${SCHEMA_FILE}），将只建表不建索引`);
 }
 
+const handleStatic = createStaticHandler(STATIC_DIR);
+
 const env = {
   DB: db,
   AES_KEY: aesKey,
@@ -126,6 +128,14 @@ const env = {
   DEFAULT_API_KEY: optionalEnv("DEFAULT_API_KEY"),
   DEFAULT_API_SECRET: optionalEnv("DEFAULT_API_SECRET"),
   DEFAULT_API_ALIAS: optionalEnv("DEFAULT_API_ALIAS"),
+  PRISM_URL: optionalEnv("PRISM_URL"),
+  PRISM_CLIENT_ID: optionalEnv("PRISM_CLIENT_ID"),
+  PRISM_CLIENT_SECRET: optionalEnv("PRISM_CLIENT_SECRET"),
+  COOKIE_DOMAIN: optionalEnv("COOKIE_DOMAIN"),
+  PRISM_SCOPE: optionalEnv("PRISM_SCOPE"),
+  ASSETS: {
+    fetch: async (req: Request) => handleStatic(req),
+  } as unknown as Fetcher,
 };
 
 await new DatabaseManager(db, aesKey).ensureTables();
@@ -151,15 +161,8 @@ const executionCtx = {
 
 // ===== 请求分流 =====
 
-const handleStatic = createStaticHandler(STATIC_DIR);
-
 async function fetchHandler(request: Request): Promise<Response> {
   const url = new URL(request.url);
-
-  // /api/* 交给业务 Worker（src/index.ts 里所有路由都挂在这个前缀下）
-  if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
-    return (await worker.fetch(request, env, executionCtx)) as Response;
-  }
 
   // 容器健康检查：顺带读一次数据库，能区分「进程活着」与「数据库可读」
   if (url.pathname === "/healthz") {
@@ -170,6 +173,18 @@ async function fetchHandler(request: Request): Promise<Response> {
       const message = e instanceof Error ? e.message : String(e);
       return Response.json({ ok: false, message }, { status: 503 });
     }
+  }
+
+  // 若配置了 Prism 鉴权，或访问的是 /api/*、/auth/*、/__logout，统一交由 Worker 处理
+  const isPrismConfigured = Boolean(env.PRISM_URL && env.PRISM_CLIENT_ID && env.PRISM_CLIENT_SECRET);
+  if (
+    isPrismConfigured ||
+    url.pathname === "/api" ||
+    url.pathname.startsWith("/api/") ||
+    url.pathname === "/auth/callback" ||
+    url.pathname === "/__logout"
+  ) {
+    return (await worker.fetch(request, env as any, executionCtx)) as Response;
   }
 
   return handleStatic(request);
