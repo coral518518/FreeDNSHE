@@ -11,7 +11,7 @@ import type { WebhookType } from "./cron";
 import { computeDnsState } from "./dns-provider";
 import type { DnsState } from "./dns-provider";
 import { toASCII } from "./punycode";
-import { withPrismAuth } from "../prism-auth.js";
+import { withPrismAuth } from "prism-authts";
 
 /**
  * 统一成功响应封装 — 将 payload 扁平化后附加 success: true，
@@ -3808,21 +3808,23 @@ app.get("/api/overview", async (c) => {
  * 3. 鉴权通过后：/api/* 交由 Hono 处理；静态前端页面交由 env.ASSETS 处理。
  */
 const handleWithPrism = withPrismAuth(
-  async (request: Request, env: Bindings, ctx: ExecutionContext, _user: unknown) => {
+  async (request, env, ctx, _user) => {
+    const bindEnv = env as Bindings;
+    const execCtx = ctx as ExecutionContext;
     const url = new URL(request.url);
 
     // 1. API 接口：交给 Hono 业务路由处理
     if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
-      const res = await app.fetch(request, env, ctx);
+      const res = await app.fetch(request, bindEnv, execCtx);
       return withSecurityHeaders(res);
     }
 
     // 2. 前端静态页面与资源（Cloudflare Assets / 自建版静态委托）
-    if (env.ASSETS) {
-      const assetRes = await env.ASSETS.fetch(request);
+    if (bindEnv.ASSETS) {
+      const assetRes = await bindEnv.ASSETS.fetch(request);
       if (assetRes.status === 404) {
         // SPA 页面路由回退到 index.html
-        return await env.ASSETS.fetch(new Request(new URL("/index.html", request.url), request));
+        return await bindEnv.ASSETS.fetch(new Request(new URL("/index.html", request.url), request));
       }
       return assetRes;
     }
@@ -3869,7 +3871,7 @@ export default {
     }
 
     // 启用 Prism 统一鉴权
-    return handleWithPrism(request, env, ctx);
+    return handleWithPrism(request, env as any, ctx);
   },
 
   // 处理 scheduled 定时任务 (Cron Trigger)
