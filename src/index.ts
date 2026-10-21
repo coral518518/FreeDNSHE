@@ -2364,6 +2364,7 @@ app.get("/api/settings", async (c) => {
     const cfg = await dbManager.getAllAppSettings();
     // 敏感字段打码后再返回
     const masked = { ...cfg };
+    if (!masked.tg_api_url) masked.tg_api_url = "https://api.telegram.org";
     if (masked.tg_token) masked.tg_token = maskSecret(cfg.tg_token);
     if (masked.webhook_url) masked.webhook_url = maskSecret(cfg.webhook_url);
     if (masked.smtp_pass) masked.smtp_pass = maskSecret(cfg.smtp_pass);
@@ -2387,7 +2388,7 @@ app.post("/api/settings", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     // 允许写入的配置键
     const allowedKeys = [
-      "webhook_url", "webhook_type", "tg_token", "tg_chat_id",
+      "webhook_url", "webhook_type", "tg_token", "tg_chat_id", "tg_api_url",
       "renew_threshold_days", "auto_renew",
       // 邮箱（SMTP）通知渠道
       "smtp_host", "smtp_port", "smtp_user", "smtp_pass", "smtp_from", "smtp_to"
@@ -2421,12 +2422,13 @@ app.post("/api/settings/test-telegram", async (c) => {
     // 优先用请求体里传入的新值（用户可能还没保存），否则用库里已存的
     const token = (body.tg_token && !String(body.tg_token).startsWith("****")) ? String(body.tg_token) : cfg.tg_token;
     const chatId = String(body.tg_chat_id || cfg.tg_chat_id || "");
+    const apiUrl = String(body.tg_api_url || cfg.tg_api_url || "");
 
     if (!token || !chatId) {
       return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
     }
 
-    const tgRes = await sendTelegramNotification(token, chatId, "🎉 DNSHE Manager 测试推送：Telegram 通知配置成功！");
+    const tgRes = await sendTelegramNotification(token, chatId, "🎉 DNSHE Manager 测试推送：Telegram 通知配置成功！", apiUrl);
     if (!tgRes.ok) {
       return c.json(errorRes(tgRes.detail || "Telegram 消息发送失败"), 400);
     }
@@ -2482,10 +2484,11 @@ app.post("/api/settings/test-webhook", async (c) => {
       };
       const token = pick("tg_token");
       const chatId = pick("tg_chat_id");
+      const apiUrl = pick("tg_api_url");
       if (!token || !chatId) {
         return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
       }
-      const tgRes = await sendTelegramNotification(token, chatId, "🎉 DNSHE 集控台 测试推送：Telegram 通知渠道配置成功！");
+      const tgRes = await sendTelegramNotification(token, chatId, "🎉 DNSHE 集控台 测试推送：Telegram 通知渠道配置成功！", apiUrl);
       if (!tgRes.ok) {
         return c.json(errorRes(tgRes.detail || "Telegram 推送失败"), 400);
       }

@@ -355,7 +355,8 @@ export async function sendSmtpMail(cfg: SmtpConfig, subject: string, body: strin
 export async function sendTelegramNotification(
   botToken: string,
   chatId: string,
-  message: string
+  message: string,
+  apiUrl?: string
 ): Promise<WebhookSendResult> {
   const cleanToken = String(botToken || "").trim();
   const cleanChatId = String(chatId || "").trim();
@@ -363,7 +364,16 @@ export async function sendTelegramNotification(
     return { ok: false, detail: "未配置 Telegram Bot Token 或 Chat ID" };
   }
   try {
-    const url = `https://api.telegram.org/bot${encodeURIComponent(cleanToken)}/sendMessage`;
+    let base = String(apiUrl || "").trim();
+    if (!base) {
+      base = "https://api.telegram.org";
+    } else {
+      if (!/^https?:\/\//i.test(base)) {
+        base = `https://${base}`;
+      }
+      base = base.replace(/\/+$/, "");
+    }
+    const url = `${base}/bot${encodeURIComponent(cleanToken)}/sendMessage`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -617,6 +627,7 @@ export async function runDailySyncAndRenewal(
   const effectiveWebhookType = (appCfg["webhook_type"] as WebhookType) || webhookType;
   const tgToken = appCfg["tg_token"] || "";
   const tgChatId = appCfg["tg_chat_id"] || "";
+  const tgApiUrl = appCfg["tg_api_url"] || "";
 
   let allAccounts: Array<{ id: number; alias: string }> = [];
   try {
@@ -825,7 +836,7 @@ export async function runDailySyncAndRenewal(
       //    「渠道选择里被选中的那一个」。设置页已把 Telegram 并进统一的渠道下拉，
       //    若仍保持无条件补发，用户选了「邮箱」也会收到 TG 消息，与界面表达不符。
       if (tgToken && tgChatId) {
-        const tgRes = await sendTelegramNotification(tgToken, tgChatId, notifyBody);
+        const tgRes = await sendTelegramNotification(tgToken, tgChatId, notifyBody, tgApiUrl);
         if (!tgRes.ok) {
           await dbManager.writeLog(
             "warning",

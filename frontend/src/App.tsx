@@ -735,6 +735,7 @@ export default function App() {
     webhook_type: string;
     tg_token: string;
     tg_chat_id: string;
+    tg_api_url: string;
     renew_threshold_days: string;
     auto_renew: string;
     // 邮箱（SMTP）通知渠道
@@ -751,6 +752,7 @@ export default function App() {
     webhook_type: "email",
     tg_token: "",
     tg_chat_id: "",
+    tg_api_url: "https://api.telegram.org",
     renew_threshold_days: "180",
     auto_renew: "1",
     smtp_host: "smtp.qq.com",
@@ -2647,6 +2649,7 @@ export default function App() {
       const payload: Record<string, string> = {
         webhook_type: settings.webhook_type,
         tg_chat_id: settings.tg_chat_id,
+        tg_api_url: settings.tg_api_url,
         renew_threshold_days: settings.renew_threshold_days,
         auto_renew: settings.auto_renew,
         // 邮箱渠道的非敏感字段直接提交
@@ -2697,10 +2700,11 @@ export default function App() {
         payload.smtp_to = settings.smtp_to;
         if (settings.smtp_pass && !settings.smtp_pass.startsWith("****")) payload.smtp_pass = settings.smtp_pass;
       }
-      // Telegram 渠道：同样把 Token / Chat ID 送去（可能是刚填、还没保存的值）
+      // Telegram 渠道：同样把 Token / Chat ID / API URL 送去（可能是刚填、还没保存的值）
       if (settings.webhook_type === "telegram") {
         if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
         payload.tg_chat_id = settings.tg_chat_id;
+        payload.tg_api_url = settings.tg_api_url;
       }
       const res = await apiFetch("/api/settings/test-webhook", {
         method: "POST",
@@ -11232,6 +11236,12 @@ export default function App() {
                           placeholder="Chat ID"
                           className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                         />
+                        <input
+                          value={settings.tg_api_url}
+                          onChange={(e) => setSettings((s) => ({ ...s, tg_api_url: e.target.value }))}
+                          placeholder="API 请求地址，默认 https://api.telegram.org（可填自建反代）"
+                          className="form-input w-full px-3 h-10 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+                        />
                       </div>
                     ) : (
                       <input
@@ -11270,6 +11280,7 @@ export default function App() {
                           在 Telegram 里找 <b>@BotFather</b> 创建机器人拿到 Bot Token；Chat ID 可用
                           <b> @userinfobot</b> 查询自己的，群聊的 ID 是负数（把机器人拉进群后发条消息，
                           访问 <code className="font-mono">getUpdates</code> 即可看到）。
+                          API 请求地址默认使用官方 <code className="font-mono">https://api.telegram.org</code>，若国内网络受限可填自建或反代地址。
                         </>
                       ) : settings.webhook_type === "serverchan" ? (
                         <>
